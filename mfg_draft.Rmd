@@ -1,0 +1,1169 @@
+---
+title: "MFG_draft"
+author: "Namuhan"
+date: "2025-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "R:/HBMSC2022-A7264/")
+```
+
+```{r message=FALSE}
+library(Seurat)
+library(dplyr)
+library(scCustomize)
+library(ggplot2)
+library(pdist)
+library(edgeR)
+library(biomaRt)
+library(Scissor)
+library(mclust)
+```
+
+
+# Preprocess Lemay dataset
+We only work with 4 washed and matrue stage samples: SRR801700, SRR801702, SRR801703, and SRR801704 
+
+## Create raw gene count matrix and convert gene ids to gene symbols
+```{r}
+filepath <- paste0("R:/HBMSC2022-A7264/51_MFG_draft/datasets/lemay/SRR801",c(700, 702, 703, 704),".tabular")
+
+df <- lapply(filepath, read.table)
+df <- data.frame(df)
+genecount <- df[2:nrow(df),c(2, 4, 6, 8)]
+colnames(genecount) <- paste0("Lemay_s", 1:4)
+geneid <- df[2:nrow(df),1]
+rownames(genecount) <- geneid
+
+genes <- getBM(attributes = c('ensembl_gene_id_version', 'hgnc_symbol'),
+               filters = 'ensembl_gene_id_version',
+               values = geneid,
+               mart = useEnsembl(biomart = "genes", 
+                                 dataset = "hsapiens_gene_ensembl",
+                                 version="GRCh37"))
+genes <- genes[genes$hgnc_symbol!="",]
+
+genes.left <- genes[!genes$hgnc_symbol %in% genes$hgnc_symbol[duplicated(genes$hgnc_symbol)],]
+genes.left <- genes.left[!genes.left$ensembl_gene_id_version %in% genes$ensembl_gene_id_version[duplicated(genes$ensembl_gene_id_version)],]
+
+genecount <- genecount[rownames(genecount) %in% genes.left$ensembl_gene_id_version,]
+
+genes.left <- genes.left[match(rownames(genecount), genes.left$ensembl_gene_id_version),]
+# all(genes.left$ensembl_gene_id_version == rownames(genecount))
+# rownames(genecount) <- genes.left$hgnc_symbol
+
+genecount <- apply(as.matrix(genecount), 2, as.numeric)
+rownames(genecount) <- genes.left$hgnc_symbol
+lemay.raw <- as.data.frame(genecount)
+
+rm(genes, genes.left, df, geneid, filepath, genecount)
+```
+
+## Normalization
+Raw count matrix: lemay.raw
+Normailzed count matrix: lemay.cpm
+```{r}
+y <- DGEList(lemay.raw)
+y <- calcNormFactors(y, method = "TMM")
+lemay.cpm <- cpm(y, log=TRUE, prior.count = 1)
+
+rm(y)
+```
+
+# Preprocess Kelsey dataset
+TPM count instead of raw counts were used later in scissor
+Fat content in metadata was re-categorized into high fat and low fat to create phenotype labels
+
+## TPM counts were directly downloaded and gene ID was converted into gene symbols
+```{r}
+kelsey.tpm <- read.csv(file="R:/HBMSC2022-A7264/51_MFG_draft/datasets/kelsey/human_milk_geneExpr_TPM.csv")
+geneID <- kelsey.tpm$X
+# options(timeout=10000)
+genes <- getBM(attributes = c('ensembl_gene_id_version', 'hgnc_symbol'),
+               filters = 'ensembl_gene_id_version',
+               values = geneID,
+               mart = useEnsembl(biomart = "genes",
+                                 dataset = "hsapiens_gene_ensembl",
+                                 version = 110))
+genes <- genes[genes$hgnc_symbol!="",]
+# length(unique(genes$hgnc_symbol))
+genes.left <- genes[!genes$hgnc_symbol %in% genes$hgnc_symbol[duplicated(genes$hgnc_symbol)],]
+genes.left <- genes.left[!genes.left$ensembl_gene_id_version %in% genes$ensembl_gene_id_version[duplicated(genes$ensembl_gene_id_version)],]
+kelsey.tpm <- kelsey.tpm[kelsey.tpm$X %in% genes.left$ensembl_gene_id_version,]
+genes.left <- genes.left[match(kelsey.tpm$X, genes.left$ensembl_gene_id_version),]
+# all(genes.left$ensembl_gene_id_version == kelsey.tpm$X)
+kelsey.tpm <- kelsey.tpm[,-1]
+kelsey.tpm <- apply(kelsey.tpm, 2, as.numeric)
+rownames(kelsey.tpm) <- genes.left$hgnc_symbol
+kelsey.tpm <- as.data.frame(kelsey.tpm)
+
+rm(genes, geneID, genes.left)
+```
+
+## Recategorize samples into different fat groups
+
+downsampling by fat content record;
+filter out lowly expressing genes to downsize the data;
+set the hat- vs low- fat threshold
+categorize the samples by their fat content: high- and low- phenotype
+
+```{r}
+kelsey.meta <- read.delim(file="R:/HBMSC2022-A7264/51_MFG_draft/datasets/kelsey/milk_sample_metadata.tsv")
+kelsey.meta <- kelsey.meta[!is.na(kelsey.meta$fat1),]
+
+kelsey.tpm <- kelsey.tpm[, intersect(colnames(kelsey.tpm),kelsey.meta$study_id)]
+kelsey.meta <- kelsey.meta[kelsey.meta$study_id %in% intersect(colnames(kelsey.tpm),kelsey.meta$study_id),] 
+kelsey.tpm <- kelsey.tpm[,match(kelsey.meta$study_id, colnames(kelsey.tpm))]
+# all(colnames(kelsey.tpm)==kelsey.meta$study_id)
+
+filtered <- edgeR::filterByExpr(kelsey.tpm, min.prop = 0.5)
+kelsey.tpm <- kelsey.tpm[filtered,]
+rm(filtered)
+
+summary(kelsey.meta$fat1)
+
+# ggplot(kelsey.meta, aes(x=fat1)) + geom_density() + theme_bw()
+
+kelsey.meta$fatLevel[kelsey.meta$fat1 < 4.023] <- "Low"
+kelsey.meta$fatLevel[kelsey.meta$fat1 > 5.598] <- "High" # 5.598, not 5.496
+kelsey.meta$fatLevel1[kelsey.meta$fatLevel == "Low"] <- 0
+kelsey.meta$fatLevel1[kelsey.meta$fatLevel == "High"] <- 1
+
+kelsey.meta <- kelsey.meta[!is.na(kelsey.meta$fatLevel),]
+kelsey.tpm <- kelsey.tpm[,kelsey.meta$study_id]
+all(colnames(kelsey.tpm)==kelsey.meta$study_id)
+
+kelsey.tag <- c("Low", "High")
+```
+
+# Preprocess Twigger dataset
+keep only LC2, subset from the integrated dataset (Twigger+Nyquist)
+what are removed: cycling cells, basal cells, LC1
+```{r}
+# twigger <- readRDS("R:/HBMSC2022-A7264/51_MFG_draft/datasets/twigger/twigger_0506.rds")
+# twigger <- twigger[,twigger$Stromal.clusters=="Epithelial"]
+
+epi <- readRDS("R:/HBMSC2022-A7264/51_MFG_draft/datasets/twigger/epi.rds")
+epi <- CreateSeuratObject(counts=epi[['RNA']]$counts, meta.data = epi@meta.data[, c("Source", "Individual", "Age","Infant_age", "percent.mt", "batch", "Parity", "bm_cell_type", "hpca.main")])
+epi <- subset(epi, subset=batch != "batch0")
+
+epi[["RNA"]] <- split(epi[["RNA"]], f = epi$batch)
+
+options(future.globals.maxSize = 8000 * 1024^2)
+epi <- SCTransform(epi, vst.flavor = "v2") %>%
+  RunPCA() %>%
+  IntegrateLayers(method = HarmonyIntegration,
+                  orig.reduction = "pca", new.reduction = "harmony") %>%
+  FindNeighbors(dims = 1:30, reduction = "pca") %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(reduction = "harmony", dims = 1:35)   
+
+epi <- subset(epi, subset = bm_cell_type=="LC2")
+# length(intersect(colnames(epi)[epi$bm_cell_type=="LC2"], colnames(twigger)[twigger$Epithelial.clusters=="Luminal_HMC2"]))
+
+twigger <- epi
+rm(epi)
+
+twigger@meta.data$processing[twigger@meta.data$Source %in% c("LMC1", "LMC2B", "LMC3", "LMC4", "LMC9")] <- "Fresh"
+twigger@meta.data$processing[twigger@meta.data$Source %in% c("LMC2", "LMC5", "LMC6", "LMC7", "LMC8")] <- "Frozen"
+
+```
+
+# Biological assumptions applied in computation
+
+## Selection 1:
+MFG events will have these characteristics:
+  Feature counts < 2000
+  Ribosomal gene expression percentage > 20%
+  Mitochondrial gene expression percentage < 5%
+```{r}
+twigger[["percent.rb"]] <- PercentageFeatureSet(twigger, pattern = "^RP[SL]")
+twigger@meta.data <- twigger@meta.data %>% mutate(selection1 = case_when(
+  percent.rb > 20 & nFeature_RNA < 2000 & percent.mt < 5 ~ "MFG",
+  .default = "Cell"))
+
+summary(twigger$percent.rb)
+summary(twigger$percent.rb[twigger$processing=="Fresh"])
+summary(twigger$percent.rb[twigger$processing=="Frozen"])
+VlnPlot(twigger, group.by = "processing", features = "percent.rb", pt.size = 0) + 
+  geom_boxplot(width = 0.1, outliers = FALSE)
+
+summary(twigger$percent.mt)
+summary(twigger$percent.mt[twigger$processing=="Fresh"])
+summary(twigger$percent.mt[twigger$processing=="Frozen"])
+VlnPlot(twigger, group.by = "processing", features = "percent.mt", pt.size = 0) + 
+  geom_boxplot(width = 0.1, outliers = FALSE)
+
+table(twigger$selection1, twigger$Source)
+table(twigger$selection1, twigger$processing)
+
+FeatureScatter(twigger, feature1 = "percent.mt", feature2 = "percent.rb", group.by = "processing") + 
+  geom_hline(yintercept = 20, color = "blue", linetype = "dashed") +
+  geom_vline(xintercept = 5, color = "blue", linetype = "dashed")
+
+# load("R:/HBMSC2022-A7264/51_MFG_draft/27Mar2026.RData")
+
+```
+## Selection 2:
+
+Transcriptome similarity between Twigger and Lemay
+  across ribosomal genes as main test
+
+### Scale the Twigger and Lemay count matrix
+```{r}
+tw.fresh <- subset(twigger, subset = processing == "Fresh")
+tw.frozen <- subset(twigger, subset = processing == "Frozen")
+
+tw.fresh <- tw.fresh[["SCT"]]$data
+tw.frozen <- tw.frozen[["SCT"]]$data
+
+ribogenes <- grep("^RP[SL]", rownames(twigger), value=TRUE)
+
+tw.fresh <- tw.fresh[Matrix::rowSums(tw.fresh) > 0,]
+tw.frozen <- tw.frozen[Matrix::rowSums(tw.frozen) > 0,]
+lemay <- lemay.cpm[Matrix::rowSums(lemay.cpm) > 0,]
+
+tw.fresh <- tw.fresh[intersect(ribogenes, rownames(lemay)),]
+tw.frozen <- tw.frozen[intersect(ribogenes, rownames(lemay)),]
+lemay <- lemay[intersect(ribogenes, rownames(lemay)),]
+
+merged.matrix <- cbind(lemay, tw.fresh, tw.frozen)
+merged.matrix.scaled <- t(scale(t(merged.matrix)))
+
+```
+
+### Euclidean distance between individual Lemay sample and Twigger events across ribosomal genes
+```{r}
+lemay.scaled <- merged.matrix.scaled[,1:4]
+tw.fresh.scaled <- merged.matrix.scaled[,5:(ncol(tw.fresh)+4)]
+tw.frozen.scaled <- merged.matrix.scaled[,(ncol(tw.fresh)+4+1):(ncol(tw.frozen)+ncol(tw.fresh)+4)]
+
+dist_lemay_fresh <- rdist::cdist(t(lemay.scaled), t(tw.fresh.scaled), metric="euclidean")
+dist_lemay_fresh <- as.matrix(dist_lemay_fresh)
+colnames(dist_lemay_fresh) <- colnames(tw.fresh.scaled)
+rownames(dist_lemay_fresh) <- colnames(lemay.scaled)
+
+dist_lemay_frozen <- rdist::cdist(t(lemay.scaled), t(tw.frozen.scaled), metric="euclidean")
+dist_lemay_frozen <- as.matrix(dist_lemay_frozen)
+colnames(dist_lemay_frozen) <- colnames(tw.frozen.scaled)
+rownames(dist_lemay_frozen) <- colnames(lemay.scaled)
+
+
+df <- data.frame(process=c(rep("Fresh", 4*ncol(dist_lemay_fresh)), 
+                           rep("Frozen", 4*ncol(dist_lemay_frozen))),
+                 dist=c(dist_lemay_fresh[1,],
+                        dist_lemay_fresh[2,],
+                        dist_lemay_fresh[3,],
+                        dist_lemay_fresh[4,],
+                        dist_lemay_frozen[1,],
+                        dist_lemay_frozen[2,],
+                        dist_lemay_frozen[3,],
+                        dist_lemay_frozen[4,]),
+                 LemaySample=c(rep("Lemay_s1", ncol(dist_lemay_fresh)),
+                               rep("Lemay_s2", ncol(dist_lemay_fresh)),
+                               rep("Lemay_s3", ncol(dist_lemay_fresh)),
+                               rep("Lemay_s4", ncol(dist_lemay_fresh)),
+                               rep("Lemay_s1", ncol(dist_lemay_frozen)),
+                               rep("Lemay_s2", ncol(dist_lemay_frozen)),
+                               rep("Lemay_s3", ncol(dist_lemay_frozen)),
+                               rep("Lemay_s4", ncol(dist_lemay_frozen))))
+
+ggplot(df, aes(x=dist, fill=process)) +
+  geom_density(alpha=0.5, position="identity") +
+  theme_bw() +
+  geom_vline(data=plyr::ddply(df, c("process", "LemaySample"), 
+                              summarise, 
+                              grp.mean=mean(dist)), 
+             aes(xintercept=grp.mean, color=process),
+             linetype="dashed") +
+  facet_wrap(~LemaySample)
+
+```
+
+### Cluster the events in fresh samples based on their distance to Lemay samples
+
+```{r}
+class_mclust <- data.frame(cells = colnames(dist_lemay_fresh))
+
+i=1 # 1, 2, 3, 4
+data <- dist_lemay_fresh[i,] 
+BIC <- mclustBIC(data,G=2)
+mod1 <- Mclust(data, x = BIC)
+class_mclust <- cbind(class_mclust, mod1$classification)
+
+i=2 # 1, 2, 3, 4
+data <- dist_lemay_fresh[i,] 
+BIC <- mclustBIC(data,G=2)
+mod1 <- Mclust(data, x = BIC)
+class_mclust <- cbind(class_mclust, mod1$classification)
+
+i=3 # 1, 2, 3, 4
+data <- dist_lemay_fresh[i,] 
+BIC <- mclustBIC(data,G=2)
+mod1 <- Mclust(data, x = BIC)
+class_mclust <- cbind(class_mclust, mod1$classification)
+
+i=4 # 1, 2, 3, 4
+data <- dist_lemay_fresh[i,] 
+BIC <- mclustBIC(data,G=2)
+mod1 <- Mclust(data, x = BIC)
+class_mclust <- cbind(class_mclust, mod1$classification)
+  
+rm(i, data, BIC, mod1)
+
+class_mclust <- class_mclust[,2:ncol(class_mclust)]
+colnames(class_mclust) <- paste0("Lemay", 1:4)
+
+class_mclust$final <- rowSums(class_mclust)
+
+class_mclust <- class_mclust %>% mutate(Group = case_when(final == 4 ~ "MFG",
+                                                          .default = "Cell"))
+
+# keeping df and class_mclust just in case
+temp <- df[df$process=="Fresh",]
+temp$Group <- rep(class_mclust$Group, times=4)
+
+ggplot(temp, aes(x=dist, fill=Group)) +
+  geom_density(alpha=0.5, position="identity") +
+  theme_bw() +
+  geom_vline(data=plyr::ddply(temp, c("Group", "LemaySample"),
+                              summarise,
+                              grp.mean=mean(dist)),
+             aes(xintercept=grp.mean),
+             linetype="dashed") +
+  facet_wrap(~LemaySample) +
+  scale_fill_manual(values=c("grey", "#FFFF00"))
+
+twigger@meta.data <- twigger@meta.data %>% mutate(selection2 = case_when(
+  colnames(twigger) %in% rownames(class_mclust)[class_mclust$Group=="MFG"] ~ "MFG",
+  .default = "Cell"
+))
+
+table(twigger$processing, twigger$selection2)
+rm(tw.fresh, tw.frozen, merged.matrix, merged.matrix.scaled, ribogenes, lemay, lemay.scaled, tw.fresh.scaled, tw.frozen.scaled, dist_lemay_fresh, dist_lemay_frozen)
+rm(temp)
+```
+
+
+## Selection 3:
+
+Kelsey sample fat level phenotype label transferring with scissor
+```{r}
+b1 <- subset(twigger, subset=batch=="batch1")
+b2 <- subset(twigger, subset=batch=="batch2")
+b3 <- subset(twigger, subset=batch=="batch3")
+
+DefaultAssay(b1) <- "RNA"
+DefaultAssay(b2) <- "RNA"
+DefaultAssay(b3) <- "RNA"
+
+b1 <- b1 %>% 
+  JoinLayers() %>%
+  GetAssay() %>%
+  CreateSeuratObject() %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData(features = rownames(.)) %>%
+  RunPCA(features = VariableFeatures(.)) %>%
+  FindNeighbors(dims = 1:25) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:25)
+b1[["RNA"]] <- as(object = b1[["RNA"]], Class = "Assay")  
+
+b2 <- b2 %>% 
+  JoinLayers() %>%
+  GetAssay() %>%
+  CreateSeuratObject() %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData(features = rownames(.)) %>%
+  RunPCA(features = VariableFeatures(.)) %>%
+  FindNeighbors(dims = 1:25) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:25)
+b2[["RNA"]] <- as(object = b2[["RNA"]], Class = "Assay") 
+
+b3 <- b3 %>% 
+  JoinLayers() %>%
+  GetAssay() %>%
+  CreateSeuratObject() %>%
+  NormalizeData() %>%
+  FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+  ScaleData(features = rownames(.)) %>%
+  RunPCA(features = VariableFeatures(.)) %>%
+  FindNeighbors(dims = 1:25) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:25)
+b3[["RNA"]] <- as(object = b3[["RNA"]], Class = "Assay")
+
+infos1 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b1, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.2, family = "binomial", Save_file = "R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff2/Scissor_1.RData")
+
+infos2 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b2, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.2, family = "binomial", Save_file = "R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff2/Scissor_2.RData")
+
+infos3 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b3, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.2, family = "binomial", Save_file = "R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff2/Scissor_3.RData")
+
+save(infos1, infos2, infos3, file = "R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff2/three_batches.RData")
+
+Scissor_select <- rep(0, ncol(b1))
+names(Scissor_select) <- colnames(b1)
+Scissor_select[infos1$Scissor_pos] <- 1
+Scissor_select[infos1$Scissor_neg] <- 2
+b1_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b2))
+names(Scissor_select) <- colnames(b2)
+Scissor_select[infos2$Scissor_pos] <- 1
+Scissor_select[infos2$Scissor_neg] <- 2
+b2_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b3))
+names(Scissor_select) <- colnames(b3)
+Scissor_select[infos3$Scissor_pos] <- 1
+Scissor_select[infos3$Scissor_neg] <- 2
+b3_scissor <- Scissor_select
+
+scissor_result <- c(b1_scissor, b2_scissor, b3_scissor)
+meta <- scissor_result[order(match(scissor_result,colnames(twigger)))]
+
+twigger <- AddMetaData(twigger, metadata = meta, col.name = "scissor_batch_0.2")
+
+```
+
+scissor on HPC, testing different cutoff: 0.4, 0.6, 0.8
+```{r}
+# save(b1, b2, b3, kelsey.tpm, kelsey.meta, kelsey.tag, file="R:/HBMSC2022-A7264/51_MFG_draft/scissor/mfg_draft_scissor_hpc.RData")
+
+infos1 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b1, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.4, family = "binomial", Save_file = "cutoff4/Scissor_1.RData")
+infos2 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b2, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.4, family = "binomial", Save_file = "cutoff4/Scissor_2.RData")
+infos3 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b3, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.4, family = "binomial", Save_file = "cutoff4/Scissor_3.RData")
+
+save(infos1, infos2, infos3, file="cutoff4/three_batches.RData")
+load("R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff4/three_batches.RData")
+
+Scissor_select <- rep(0, ncol(b1))
+names(Scissor_select) <- colnames(b1)
+Scissor_select[infos1$Scissor_pos] <- 1
+Scissor_select[infos1$Scissor_neg] <- 2
+b1_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b2))
+names(Scissor_select) <- colnames(b2)
+Scissor_select[infos2$Scissor_pos] <- 1
+Scissor_select[infos2$Scissor_neg] <- 2
+b2_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b3))
+names(Scissor_select) <- colnames(b3)
+Scissor_select[infos3$Scissor_pos] <- 1
+Scissor_select[infos3$Scissor_neg] <- 2
+b3_scissor <- Scissor_select
+
+scissor_result <- c(b1_scissor, b2_scissor, b3_scissor)
+meta <- scissor_result[order(match(scissor_result,colnames(twigger)))]
+
+twigger <- AddMetaData(twigger, metadata = meta, col.name = "scissor_batch_0.4")
+
+
+
+
+
+infos1 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b1, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.6, family = "binomial", Save_file = "cutoff6/Scissor_1.RData")
+infos2 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b2, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.6, family = "binomial", Save_file = "cutoff6/Scissor_2.RData")
+infos3 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b3, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.6, family = "binomial", Save_file = "cutoff6/Scissor_3.RData")
+
+save(infos1, infos2, infos3, file="cutoff6/three_batches.RData")
+load("R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff6/three_batches.RData")
+
+Scissor_select <- rep(0, ncol(b1))
+names(Scissor_select) <- colnames(b1)
+Scissor_select[infos1$Scissor_pos] <- 1
+Scissor_select[infos1$Scissor_neg] <- 2
+b1_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b2))
+names(Scissor_select) <- colnames(b2)
+Scissor_select[infos2$Scissor_pos] <- 1
+Scissor_select[infos2$Scissor_neg] <- 2
+b2_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b3))
+names(Scissor_select) <- colnames(b3)
+Scissor_select[infos3$Scissor_pos] <- 1
+Scissor_select[infos3$Scissor_neg] <- 2
+b3_scissor <- Scissor_select
+
+scissor_result <- c(b1_scissor, b2_scissor, b3_scissor)
+meta <- scissor_result[order(match(scissor_result,colnames(twigger)))]
+
+twigger <- AddMetaData(twigger, metadata = meta, col.name = "scissor_batch_0.6")
+
+infos1 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b1, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.8, family = "binomial", Save_file = "cutoff8/Scissor_1.RData")
+infos2 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b2, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.8, family = "binomial", Save_file = "cutoff8/Scissor_2.RData")
+infos3 <- Scissor(bulk_dataset = as.matrix(kelsey.tpm), sc_dataset = b3, kelsey.meta$fatLevel1, tag = kelsey.tag, alpha = NULL, cutoff = 0.8, family = "binomial", Save_file = "cutoff8/Scissor_3.RData")
+
+save(infos1, infos2, infos3, file="cutoff8/three_batches.RData")
+load("R:/HBMSC2022-A7264/51_MFG_draft/scissor/cutoff8/three_batches.RData")
+
+Scissor_select <- rep(0, ncol(b1))
+names(Scissor_select) <- colnames(b1)
+Scissor_select[infos1$Scissor_pos] <- 1
+Scissor_select[infos1$Scissor_neg] <- 2
+b1_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b2))
+names(Scissor_select) <- colnames(b2)
+Scissor_select[infos2$Scissor_pos] <- 1
+Scissor_select[infos2$Scissor_neg] <- 2
+b2_scissor <- Scissor_select
+
+Scissor_select <- rep(0, ncol(b3))
+names(Scissor_select) <- colnames(b3)
+Scissor_select[infos3$Scissor_pos] <- 1
+Scissor_select[infos3$Scissor_neg] <- 2
+b3_scissor <- Scissor_select
+
+scissor_result <- c(b1_scissor, b2_scissor, b3_scissor)
+meta <- scissor_result[order(match(scissor_result,colnames(twigger)))]
+
+twigger <- AddMetaData(twigger, metadata = meta, col.name = "scissor_batch_0.8")
+```
+
+check and compare the results from different cutoff parameters
+```{r}
+rm(meta, scissor_result, Scissor_select, b3_scissor, b2_scissor, b1_scissor, infos1, infos2, infos3)
+# rm(b1, b2, b3)
+
+DimPlot(twigger, reduction = 'umap', group.by = 'scissor_batch_0.2', cols = c('grey','indianred1','royalblue'), pt.size = 1.2, order = c(2, 1))
+
+DimPlot(twigger, reduction = 'umap', group.by = 'scissor_batch_0.4', cols = c('grey','indianred1','royalblue'), pt.size = 1.2, order = c(2, 1))
+
+DimPlot(twigger, reduction = 'umap', group.by = 'scissor_batch_0.6', cols = c('grey','indianred1','royalblue'), pt.size = 1.2, order = c(2, 1))
+
+DimPlot(twigger, reduction = 'umap', group.by = 'scissor_batch_0.8', cols = c('grey','indianred1','royalblue'), pt.size = 1.2, order = c(2, 1))
+
+```
+
+```{r}
+rm(b1, b2, b3)
+```
+
+
+cutoff=0.6 was used
+```{r}
+twigger$selection3 <- "Cell"
+twigger$selection3[twigger$scissor_batch_0.6==1] <- "MFG"
+table(twigger$selection3, twigger$processing)
+```
+
+
+## Majority vote of three selection methods
+
+Venn plot to visualize the label results
+```{r}
+library(ggVennDiagram)
+ggVennDiagram(list(Selection1 = colnames(twigger)[twigger$selection1=="MFG"],
+                   Selection2 = colnames(twigger)[twigger$selection2=="MFG"],
+                   Selection3 = colnames(twigger)[twigger$selection3=="MFG"]),
+              set_size = 6, label_size = 9) +
+  scale_fill_gradient(low = "#F4FAFE", high = "#4981BF") +
+  theme(legend.position = "none")
+```
+
+majority voting
+```{r}
+twigger$final_decision <- "Cell"
+twigger$final_decision[twigger$selection1=="MFG" & twigger$selection2=="MFG" & twigger$selection3=="MFG"] <- "MFG"
+table(twigger$final_decision)
+```
+## MFG specific gene set
+
+re-normalize and batch correct (integrate) the data for LC2 cells
+```{r}
+twigger.lc2.re <- twigger
+DefaultAssay(twigger.lc2.re) <- "RNA"
+
+twigger.lc2.re <- JoinLayers(twigger.lc2.re) %>%
+  split(f = .$batch) %>%
+  SCTransform() %>%
+  RunPCA(assay = "SCT") %>%
+  RunUMAP(dims = 1:25, assay = "SCT") %>%
+  FindNeighbors(dims = 1:25) %>%
+  FindClusters(resolution = 0.8) %>%
+  IntegrateLayers(method = HarmonyIntegration,
+                  orig.reduction = "pca",
+                  verbose = FALSE) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:25, assay = "SCT") %>%
+  FindClusters(resolution = 0.3) %>%
+  RunUMAP(reduction = "harmony", dims = 1:25, assay = "SCT")
+
+twigger.lc2.re <- PrepSCTFindMarkers(twigger.lc2.re)
+
+```
+
+downsample and determine the cell group representation for DE analysis
+- cells were labeled as Cell in Selection 1 and from fresh samples were used as cell pool for sampling
+
+```{r}
+mfg.barcode <- colnames(twigger.lc2.re)[twigger.lc2.re$final_decision=="MFG"]
+cell.bracode <- colnames(twigger.lc2.re)[twigger.lc2.re$selection1=="Cell"&twigger.lc2.re$processing=="Fresh"]
+```
+
+Available probe sets in Lifeblood dataset
+```{r}
+avail_probeset <- read.csv("R:/HBMSC2022-A7264/51_MFG_draft/datasets/lifeblood/Chromium_Human_Transcriptome_Probe_Set_v1.0.1_GRCh38-2020-A.csv",header = TRUE, skip=5)
+avail_probeset <- avail_probeset$probe_id
+avail_probeset <- stringr::str_match(avail_probeset, "\\|\\s*(.*?)\\s*\\|")[,2]
+avail_probeset <- unique(avail_probeset)
+
+```
+
+- repeat 5 times and select the common DEGs
+```{r}
+marker.list <- lapply(1:5, function(i){
+  seed.pool <- c(233, 234, 235, 236, 237)
+  set.seed(seed.pool[i])
+  cell.sub <- sample(cell.bracode, size = length(mfg.barcode), replace=F)
+  
+  temp <- twigger.lc2.re
+  temp$de <- "background"
+  temp$de[colnames(temp) %in% mfg.barcode] <- "mfg"
+  temp$de[colnames(temp) %in% cell.sub] <- "cell"
+  Idents(temp) <- "de"
+  
+  mfg.marker <- FindMarkers(temp, 
+                            ident.1 = "mfg",
+                            ident.2 = "cell",
+                            test.use = "wilcox")
+  mfg.marker <- mfg.marker %>% filter(p_val_adj < 0.05)
+  return(mfg.marker)
+})
+
+sapply(marker.list, nrow)
+sapply(marker.list, function(dataframe){
+  table(dataframe$avg_log2FC>0)
+})
+
+geneset_up_threshold.list <- lapply(c(0, 0.5, 1, 1.5, 2), function(i){
+  Reduce(intersect, lapply(marker.list, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC>i]}))
+})
+
+geneset_down_threshold.list <- lapply(c(0, -0.5, -1, -1.5, -2), function(i){
+  Reduce(intersect, lapply(marker.list, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC<i]}))
+})
+
+```
+
+
+repeat 10 times (just for testing and results won't be further taken)
+```{r}
+marker.list.10 <- lapply(1:10, function(i){
+  seed.pool <- c(233, 234, 235, 236, 237, 238, 239, 240, 241, 242)
+  set.seed(seed.pool[i])
+  cell.sub <- sample(cell.bracode, size = length(mfg.barcode), replace=F)
+  
+  temp <- twigger.lc2.re
+  temp$de <- "background"
+  temp$de[colnames(temp) %in% mfg.barcode] <- "mfg"
+  temp$de[colnames(temp) %in% cell.sub] <- "cell"
+  Idents(temp) <- "de"
+  
+  mfg.marker <- FindMarkers(temp, 
+                            ident.1 = "mfg",
+                            ident.2 = "cell",
+                            test.use = "wilcox")
+  mfg.marker <- mfg.marker %>% filter(p_val_adj < 0.05)
+  return(mfg.marker)
+})
+
+sapply(marker.list.10, nrow)
+sapply(marker.list.10, function(dataframe){
+  table(dataframe$avg_log2FC>0)
+})
+
+geneset_up_threshold.list.10 <- lapply(c(0, 0.5, 1, 1.5, 2), function(i){
+  Reduce(intersect, lapply(marker.list.10, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC>i]}))
+})
+
+geneset_down_threshold.list.10 <- lapply(c(0, -0.5, -1, -1.5, -2), function(i){
+  Reduce(intersect, lapply(marker.list.10, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC<i]}))
+})
+```
+
+```{r}
+
+common.de.all.list <- lapply(list(geneset_up_threshold.list, 
+         geneset_down_threshold.list,
+         geneset_up_threshold.list.10,
+         geneset_down_threshold.list.10), function(list){
+  sapply(list, function(i){
+  intersect(i, avail_probeset)
+}) 
+})
+
+lapply(common.de.all.list, lengths)
+
+# common.de.all.list variable includes:
+# [[1]] common DE over repeat = 5 and probes, UP in MFG, across 5 LC
+# [[2]] common DE over repeat = 5 and probes, DOWN in MFG, across 5 LC
+# [[3]] common DE over repeat = 10 and probes, UP in MFG, across 5 LC
+# [[4]] common DE over repeat = 10 and probes, DOWN in MFG, across 5 LC
+rm(avail_probeset)
+```
+
+save image
+
+Decide to use 5 repeats and 1.5 log2FC cutoff
+
+```{r}
+mfg.positive <- common.de.all.list[[1]][[4]]
+mfg.negative <- common.de.all.list[[2]][[4]]
+cat(mfg.positive, sep = ", ")
+cat(mfg.negative, sep = ", ")
+# oldset <- readRDS(file="R:/HBMSC2022-A7264/48_RedCross_samples/07_scissor/geneSets.rds")
+```
+
+a different visualization for DE marker counts
+```{r}
+
+de.counts <- data.frame(counts=unlist(lapply(common.de.all.list, lengths)),
+                        sd=xxx,
+                        iteration=factor(c(rep("iteration5", 10), 
+                                           rep("iteration10", 10)), 
+                                         levels = c("iteration5", "iteration10")),
+                        threshold=rep(factor(c(0,0.5, 1, 1.5, 2)), 4),
+                        direction=factor(rep(c("Up", "Down", "Up", "Down"), 
+                                             each=5), 
+                                         levels = c("Up", "Down")))
+de.counts %>% 
+  ggplot(aes(x=threshold, y=counts, colour = direction, group = interaction(direction, iteration))) +
+  geom_line(aes(linetype = iteration), linewidth = 1.3) +
+  geom_errorbar(aes(ymin=counts-sd, ymax=counts+sd), width=.2,
+                 position=position_dodge(0.05)) +
+  theme_bw() +
+  theme(legend.text=element_text(size=15),
+        axis.title = element_text(size = 15))
+  
+
+```
+
+A line plot that doesn't exclude non-probe genes
+```{r}
+geneset_up_all_threshold.list.10 <- lapply(c(0, 0.5, 1, 1.5, 2), function(i){
+  lapply(marker.list.10, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC>i]})
+})
+
+geneset_down_all_threshold.list.10 <- lapply(c(0, -0.5, -1, -1.5, -2), function(i){
+  lapply(marker.list.10, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC<i]})
+})
+
+geneset_up_all_threshold.list.5 <- lapply(c(0, 0.5, 1, 1.5, 2), function(i){
+  lapply(marker.list, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC>i]})
+})
+
+geneset_down_all_threshold.list.5 <- lapply(c(0, -0.5, -1, -1.5, -2), function(i){
+  lapply(marker.list, function(dataframe){rownames(dataframe)[dataframe$avg_log2FC<i]})
+})
+
+sapply(geneset_up_all_threshold.list.10, lengths)
+sapply(geneset_down_all_threshold.list.10, lengths)
+sapply(geneset_up_all_threshold.list.5, lengths)
+sapply(geneset_down_all_threshold.list.5, lengths)
+
+apply(sapply(geneset_up_all_threshold.list.10, lengths), 2,sd)
+apply(sapply(geneset_down_all_threshold.list.10, lengths), 2,sd)
+apply(sapply(geneset_up_all_threshold.list.5, lengths), 2,sd)
+apply(sapply(geneset_down_all_threshold.list.5, lengths), 2,sd)
+
+apply(sapply(geneset_up_all_threshold.list.10, lengths), 2,mean)
+apply(sapply(geneset_down_all_threshold.list.10, lengths), 2,mean)
+apply(sapply(geneset_up_all_threshold.list.5, lengths), 2,mean)
+apply(sapply(geneset_down_all_threshold.list.5, lengths), 2,mean)
+
+# unlist(lapply(list(geneset_up_threshold.list, 
+#          geneset_down_threshold.list,
+#          geneset_up_threshold.list.10,
+#          geneset_down_threshold.list.10), lengths))
+
+# common.de.inclusive.list <- list(geneset_up_threshold.list, 
+#          geneset_down_threshold.list,
+#          geneset_up_threshold.list.10,
+#          geneset_down_threshold.list.10)
+
+
+de.inclusive.counts <- data.frame(counts=c(apply(sapply(geneset_up_all_threshold.list.5, lengths), 2,mean),
+                                            apply(sapply(geneset_down_all_threshold.list.5, lengths), 2,mean),
+                                            apply(sapply(geneset_up_all_threshold.list.10, lengths), 2,mean),
+                                            apply(sapply(geneset_down_all_threshold.list.10, lengths), 2,mean)),
+                        sd=c(apply(sapply(geneset_up_all_threshold.list.5, lengths), 2,sd),
+                             apply(sapply(geneset_down_all_threshold.list.5, lengths), 2,sd),
+                             apply(sapply(geneset_up_all_threshold.list.10, lengths), 2,sd),
+                             apply(sapply(geneset_down_all_threshold.list.10, lengths), 2,sd)),
+                        iteration=factor(c(rep("iteration5", 10), 
+                                           rep("iteration10", 10)), 
+                                         levels = c("iteration5", "iteration10")),
+                        threshold=rep(factor(c(0,0.5, 1, 1.5, 2)), 4),
+                        direction=factor(rep(c("Up", "Down", "Up", "Down"), 
+                                             each=5), 
+                                         levels = c("Up", "Down")))
+de.inclusive.counts %>% 
+  ggplot(aes(x=threshold, y=counts, colour = direction, group = interaction(direction, iteration))) +
+  geom_line(aes(linetype = iteration), linewidth = 1.5) +
+  geom_errorbar(aes(ymin=counts-sd, ymax=counts+sd), width=.2,
+                 position=position_dodge(0.05)) +
+  theme_bw() +
+  # labs(title = "All DE genes including non-probeset genes and without common gene subset step")+
+  theme(legend.text=element_text(size=20),
+        axis.title = element_text(size = 20),
+        axis.text.x = element_text(size = 20),
+        axis.text.y = element_text(size = 20))
+
+
+
+```
+
+
+verify #11 comment
+```{r}
+up_i5_1.5_common <- common.de.all.list[[1]][[4]]
+up_i10_1.5_common <- common.de.all.list[[3]][[4]]
+
+down_i5_1.5_common <- common.de.all.list[[2]][[4]]
+down_i10_1.5_common <- common.de.all.list[[4]][[4]]
+
+library(VennDiagram)
+
+venn.diagram(x = list(iteration_5 = common.de.all.list[[1]][[4]],
+                      iteration_10 = common.de.all.list[[3]][[4]]), 
+             disable.logging = T,
+             filename = NULL,
+             output = FALSE,
+             fill = c(alpha('#440154ff',0.3), alpha('#fde725ff',0.3)),
+             cat.col = c("#440154ff", '#fde725ff'))
+
+venn.diagram(x = list(iteration_5 = common.de.all.list[[2]][[4]],
+                      iteration_10 = common.de.all.list[[4]][[4]]), 
+             disable.logging = T,
+             filename = NULL,
+             output = FALSE,
+             fill = c(alpha('#440154ff',0.3), alpha('#fde725ff',0.3)),
+             cat.col = c("#440154ff", '#fde725ff'))
+
+```
+
+
+# Verification
+
+```{r}
+library(escape)
+library(ggridges)
+library(forcats)
+geneSets <- list(MFGposi=mfg.positive, MFGnega=mfg.negative)
+
+```
+
+
+## MFG identification in Twigger dataset
+```{r}
+twigger.lc2.re <- runEscape(twigger.lc2.re,
+                            method = "UCell", # "AUCell"
+                            gene.sets = geneSets,
+                            groups = 5000,
+                            min.size = NULL,
+                            normalize = FALSE,
+                            new.assay.name = "escape.UCell") # "escape.UCell.norm"
+
+pp <- ridgeEnrichment(twigger.lc2.re, 
+                assay = "escape.UCell",
+                gene.set = "MFGposi",
+                color.by = "MFGposi")
+
+pn <- ridgeEnrichment(twigger.lc2.re, 
+                assay = "escape.UCell",
+                gene.set = "MFGnega",
+                color.by = "MFGnega")
+
+temp <- data.frame(difference=(pp$data$MFGposi - pn$data$MFGnega),
+                   cluster=as.character(pn$data$ident),
+                   process=twigger.lc2.re@meta.data$processing,
+                   class=twigger.lc2.re@meta.data$final_decision)
+
+# Idents(twigger.lc2.re) <- "seurat_clusters"
+
+heatmapEnrichment(twigger.lc2.re,
+                  assay= "escape.UCell",
+                  group.by = "seurat_clusters",
+                  scale=TRUE)
+
+geyserEnrichment(twigger.lc2.re,
+                 assay = "escape.UCell",
+                 gene.set = "MFGposi", # "MFGnega", "MFGposi"
+                 order.by = "mean") # facet.by = "processing"
+
+DimPlot(twigger.lc2.re, group.by="seurat_clusters", split.by = "final_decision", label = T)
+
+ggplot(temp, aes(x=difference, fill=class)) + 
+  geom_density(alpha = 0.5) +
+  theme_bw()
+
+temp %>% # ridge plot
+  mutate(cluster = fct_reorder(cluster, difference, .fun='mean')) %>%
+  ggplot(aes(y=reorder(cluster, difference), x=difference, fill=cluster)) + 
+  geom_density_ridges() +
+  facet_grid("class")+ # "class", "process"
+  theme_ridges() + 
+  theme(legend.position = "none") +
+  ylab("") +
+  xlab("") 
+
+
+temp %>% # violin plot
+  mutate(cluster = fct_reorder(cluster, difference, .fun='mean')) %>%
+  ggplot(aes(x=reorder(cluster, difference), y=difference, fill=cluster)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# geyser plot
+
+temp %>% 
+  mutate(cluster = fct_reorder(cluster, difference, .fun='mean'))
+
+twigger.lc2.re$diff <- (pp$data$MFGposi - pn$data$MFGnega)
+FeaturePlot(twigger.lc2.re, feature="diff")
+
+SCpubr::do_GeyserPlot(sample = twigger.lc2.re,
+                      features = "diff",
+                      scale_type = "continuous",
+                      order_by_mean = TRUE) # "categorical"
+
+```
+
+save image
+
+## MFG indentification in lifeblood dataset
+
+```{r}
+lifeblood.epi <- readRDS("R:/HBMSC2022-A7264/51_MFG_draft/datasets/lifeblood/Lifeblood_epithelials.rds")
+
+lifeblood.epi <- runEscape(lifeblood.epi,
+                           method = "UCell",
+                           gene.sets = geneSets,
+                           groups = 5000,
+                           min.size = 0,
+                           new.assay.name = "escape.UCell")
+
+heatmapEnrichment(lifeblood.epi,
+                  assay= "escape.UCell",
+                  group.by = "seurat_clusters",
+                  scale=TRUE)
+
+pp <- ridgeEnrichment(lifeblood.epi, 
+                assay = "escape.UCell",
+                gene.set = "MFGposi",
+                order.by = "mean",
+                color.by = "MFGposi") 
+
+pn <- ridgeEnrichment(lifeblood.epi, 
+                assay = "escape.UCell",
+                gene.set = "MFGnega",
+                order.by = "mean",
+                color.by = "MFGnega")
+
+temp <- data.frame(difference=(pp$data$MFGposi - pn$data$MFGnega),
+                   cluster=as.character(pn$data$ident))
+
+temp %>%
+  mutate(cluster = fct_reorder(cluster, difference, .fun='mean')) %>%
+  ggplot(aes(y=reorder(cluster, difference), x=difference, fill=cluster)) + 
+    geom_density_ridges() +
+    theme_ridges() + 
+    theme(legend.position = "none") +
+    ylab("") +
+    xlab("")
+
+temp %>%
+  mutate(cluster = fct_reorder(cluster, difference, .fun='mean')) %>%
+  ggplot(aes(x=reorder(cluster, difference), y=difference, fill=cluster)) +
+  geom_violin() +
+  geom_boxplot(width = 0.1) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+lifeblood.epi$diff <- (pp$data$MFGposi - pn$data$MFGnega)
+FeaturePlot(lifeblood.epi, feature="diff")
+
+SCpubr::do_GeyserPlot(sample = lifeblood.epi,
+                      features = "diff",
+                      scale_type = "continuous") # "categorical"
+```
+
+try something new and different but not going to keep and use
+```{r}
+enrichment.scores <- escape.matrix(lifeblood.epi, 
+                                   gene.sets = geneSets, 
+                                   groups = 5000, 
+                                   min.size = 0,
+                                   method = "UCell")
+ggplot(data = as.data.frame(enrichment.scores), 
+      mapping = aes(enrichment.scores[,1], enrichment.scores[,2])) + 
+  geom_point() + 
+  theme_classic()
+rm(enrichment.scores)
+```
+
+
+## MFG indentification in integrated dataset (twigger+nyquist+lifeblood)
+```{r}
+inte_3ds <- readRDS("R:/HBMSC2022-A7264/51_MFG_draft/datasets/integrated/twi_nyq_lifeblood/integrated_3ds_epi.rds")
+inte_3ds <- runEscape(inte_3ds,
+                      method = "UCell",
+                      gene.sets = geneSets,
+                      groups = 5000,
+                      min.size = 0,
+                      new.assay.name = "escape.UCell")
+
+DimPlot(inte_3ds, label=TRUE)
+DimPlot(inte_3ds, label = TRUE, split.by = "DS")
+
+heatmapEnrichment(inte_3ds,
+                  assay= "escape.UCell",
+                  group.by = "seurat_clusters",
+                  scale=TRUE)
+
+pp <- ridgeEnrichment(inte_3ds, 
+                assay = "escape.UCell",
+                gene.set = "MFGposi",
+                order.by = "mean",
+                color.by = "MFGposi") 
+
+pn <- ridgeEnrichment(inte_3ds, 
+                assay = "escape.UCell",
+                gene.set = "MFGnega",
+                order.by = "mean",
+                color.by = "MFGnega")
+
+inte_3ds$diff <- (pp$data$MFGposi - pn$data$MFGnega)
+FeaturePlot(inte_3ds, feature="diff")
+
+SCpubr::do_GeyserPlot(sample = inte_3ds,
+                      features = "diff",
+                      scale_type = "continuous") # "categorical"
+
+
+```
+
+
+## Cross validation of MFGs in lifeblood dataset and Twigger dataset within the integrated dataset
+```{r}
+twigger_labels <- paste0("NC_", rownames(twigger.lc2.re@meta.data[twigger.lc2.re@meta.data$final_decision=="MFG",]))
+lifeblood_cluster3 <- paste0("RED_", rownames(lifeblood.epi@meta.data[lifeblood.epi@meta.data$seurat_clusters=="3",]))
+# lifeblood_cluster4 <- paste0("RED_", rownames(lifeblood.epi@meta.data[lifeblood.epi@meta.data$seurat_clusters=="4",]))
+
+inte_3ds@meta.data$mfg <- "tbd"
+inte_3ds@meta.data$mfg[rownames(inte_3ds@meta.data) %in% lifeblood_cluster3] <- "Lifeblood_cluster_3"
+
+#save.image() # 25 April 2025
+inte_3ds$CT1
+
+twigger_cluster3 <- paste0("NC_", rownames(twigger.lc2.re@meta.data[twigger.lc2.re@meta.data$seurat_clusters=="3",]))
+
+inte_3ds@meta.data$mfg[rownames(inte_3ds@meta.data) %in% twigger_cluster3] <- "Twigger_cluster_3"
+inte_3ds@meta.data$mfg[rownames(inte_3ds@meta.data) %in% twigger_labels] <- "Twigger_MFG"
+
+DimPlot(inte_3ds, group.by = "mfg", split.by = "DS", cols=c("#046C9A","#FAEFD1","#FCC89B", "#CB2314"))
+# "#BE4D00" "#F68D2E" "#CC8A00" "#FDBE87""#FDAA63" "#FCC89B"
+
+
+table(inte_3ds@meta.data[(inte_3ds$seurat_clusters==10 & inte_3ds$DS=="RedCr"),]$mfg)
+
+data <- data.frame(table(inte_3ds@meta.data[inte_3ds$seurat_clusters==10,]$DS))
+data$Var1 <- c("Twigger", "Nyquist", "Lifeblood")
+ggplot(data, aes(x="", y=Freq, fill=Var1)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values = c("#F8AFA8", "#FD6467", "#7FC0C6")) +
+  theme(legend.title=element_blank(),
+        legend.text=element_text(size=30))
+
+data <- data.frame(table(inte_3ds$DS))
+data$Var1 <- c("Twigger", "Nyquist", "Lifeblood")
+ggplot(data, aes(x="", y=Freq, fill=Var1)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values = c("#F8AFA8", "#FD6467", "#7FC0C6")) +
+  theme(legend.title=element_blank(),
+        legend.text=element_text(size=30))
+
+
+mfg_3ds_lifeblood <- colnames(inte_3ds[,inte_3ds$seurat_clusters==10&inte_3ds$DS=="RedCr"])
+
+library(ggvenn)
+ggvenn(
+  list(integrated=mfg_3ds_lifeblood, lifeblood=lifeblood_cluster3), 
+  fill_color = c("#0073C2FF", "#EFC000FF"),
+  stroke_size = 0.5, set_name_size = 4, auto_scale = T
+)
+
+```
+
+## MFG indentification in larger integrated dataset (all five + lifeblood)
+```{r}
+inte_6ds_mfg_cluster12 <- readRDS("51_MFG_draft/cluster12_epi_6ds.rds")
+
+table(inte_6ds_mfg_cluster12$dataset)
+mfg_6ds_lifeblood <- subset(inte_6ds_mfg_cluster12, subset = dataset=="Lifeblood")
+
+mfg_6ds_lifeblood <- paste0("RED_", colnames(mfg_6ds_lifeblood))
+
+length(mfg_6ds_lifeblood)
+length(lifeblood_cluster3)
+
+data <- data.frame(table(inte_6ds_mfg_cluster12$dataset))
+# data <- data %>% 
+#   arrange(desc(Var1)) %>%
+#   mutate(prop = Freq / sum(data$Freq) *100) %>%
+#   mutate(ypos = cumsum(prop)- 0.5*prop )
+
+ggplot(data, aes(x="", y=Freq, fill=Var1)) +
+  geom_bar(stat="identity", width=1, color="white") +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values = c("#FAEFD1", "#DC863B", "#DCCB4E","#F8AFA8", "#FD6467", "#7FC0C6")) +
+  theme(legend.title=element_blank(),
+        legend.text=element_text(size=30))
+
+# ggplot(data, aes(x="", y=prop, fill=Var1)) +
+#   geom_bar(stat="identity", width=1, color="white") +
+#   coord_polar("y", start=0) +
+#   theme_void() + 
+#   theme(legend.position="none") +
+#   geom_text(aes(y = ypos, label = Var1), color = "white", size=6) +
+#   scale_fill_brewer(palette="Set1")
+
+
+library(ggvenn)
+ggvenn(
+  list(integrated=mfg_6ds_lifeblood, lifeblood=lifeblood_cluster3), 
+  fill_color = c("#0073C2FF", "#EFC000FF"),
+  stroke_size = 0.5, set_name_size = 4, auto_scale=T
+)
+
+ggvenn(
+  list(integrated_3ds_cluster10_lifeblood=mfg_3ds_lifeblood, lifeblood=lifeblood_cluster3, integrated_6ds_cluster12_lifeblood=mfg_6ds_lifeblood), 
+  fill_color = c("#0073C2FF", "#EFC000FF", "#CD534CFF"),
+  stroke_size = 0.5, set_name_size = 4
+)
+
+SCpubr::do_GeyserPlot(sample = inte_3ds,
+                      features = "diff",
+                      scale_type = "continuous")
+
+```
+
+
+
